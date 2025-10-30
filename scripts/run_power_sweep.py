@@ -8,16 +8,16 @@ import argparse
 import csv
 import json
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 import torch
 
-import scripts.power_control as power_control
-from scripts.benchmark_tflops import BenchmarkResult, benchmark
+from . import power_control
+from .benchmark_tflops import BenchmarkResult, benchmark
+from .clock_optimizer import optimize_all_power_limits, save_optimization_results, PowerSampler
 
 
 @dataclass
@@ -27,71 +27,11 @@ class SweepConfig:
     mem_clock: Optional[int]
 
 
-class PowerSampler:
-    """Background sampler that polls ``nvidia-smi`` for power draw."""
-
-    def __init__(self, *, interval_s: float, gpu_index: int) -> None:
-        self.interval_s = max(interval_s, 0.05)
-        self.gpu_index = gpu_index
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._samples: List[float] = []
-        self._lock = threading.Lock()
-
-    def start(self) -> None:
-        if self._thread is not None:
-            raise RuntimeError("PowerSampler already started")
-
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        if self._thread is None:
-            return
-
-        self._stop.set()
-        self._thread.join()
-        self._thread = None
-
-    def stats(self) -> Dict[str, float]:
-        with self._lock:
-            samples = list(self._samples)
-
-        if not samples:
-            raise RuntimeError("No power samples collected")
-
-        avg = sum(samples) / len(samples)
-        return {
-            "power_samples": len(samples),
-            "avg_power_w": avg,
-            "min_power_w": min(samples),
-            "max_power_w": max(samples),
-        }
-
-    def _loop(self) -> None:
-        next_deadline = time.perf_counter()
-        while not self._stop.is_set():
-            try:
-                telemetry = power_control.query_telemetry(gpu_index=self.gpu_index)
-            except RuntimeError as exc:
-                # Log once then keep trying.
-                print(f"warning: telemetry query failed ({exc})", file=sys.stderr)
-                telemetry = None
-
-            if telemetry is not None and telemetry.power_w is not None:
-                with self._lock:
-                    self._samples.append(telemetry.power_w)
-
-            next_deadline += self.interval_s
-            delay = max(0.0, next_deadline - time.perf_counter())
-            self._stop.wait(delay)
-
-
-def _parse_list(values: Sequence[float | int]) -> List[float | int]:
+def _parse_list(values) -> List:
     return list(values)
 
 
-def _resolve_value(values: Optional[List[float | int]], index: int) -> Optional[float | int]:
+def _resolve_value(values: Optional[List], index: int) -> Optional[float | int]:
     if not values:
         return None
     if len(values) == 1:
@@ -126,6 +66,25 @@ def _parse_args() -> argparse.Namespace:
         default=[],
         help="Memory clock targets (MHz); len must be 1 or match power limits",
     )
+    parser.add_argument(
+        "--optimize-clocks",
+        action="store_true",
+        help="Optimize SM and memory clocks for each power limit",
+    )
+    parser.add_argument(
+        "--sm-clock-range",
+        type=int,
+        nargs=3,
+        metavar=("MIN", "MAX", "STEP"),
+        help="SM clock range for optimization: min max step. If not specified, queries GPU for supported clocks.",
+    )
+    parser.add_argument(
+        "--mem-clock-range",
+        type=int,
+        nargs=3,
+        metavar=("MIN", "MAX", "STEP"),
+        help="Memory clock range for optimization: min max step. If not specified, queries GPU for supported clocks.",
+    )
     parser.add_argument("--settle-seconds", type=float, default=3.0, help="Delay after applying limits")
     parser.add_argument(
         "--sample-interval",
@@ -144,6 +103,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--k", type=int, default=8192)
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=2000)
+    parser.add_argument(
+        "--gpu-warmup",
+        action="store_true",
+        default=True,
+        help="Enable GPU warm-up before optimization (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-gpu-warmup",
+        action="store_false",
+        dest="gpu_warmup",
+        help="Disable GPU warm-up before optimization",
+    )
+    parser.add_argument(
+        "--warmup-iters",
+        type=int,
+        default=2000,
+        help="Number of iterations for GPU warm-up (default: 2000)",
+    )
+    parser.add_argument(
+        "--max-combinations",
+        type=int,
+        default=0,
+        help="Maximum number of clock combinations to test using statistical percentiles (0 = test all, default: 0)",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -200,9 +183,6 @@ def run_sweep(args: argparse.Namespace) -> None:
         # Guarantee at least one pass even when no power adjustments requested.
         power_limits = [None]  # type: ignore[list-item]
 
-    sm_clocks = _parse_list(args.sm_clocks)
-    mem_clocks = _parse_list(args.mem_clocks)
-
     fieldnames = [
         "timestamp",
         "tag",
@@ -231,80 +211,96 @@ def run_sweep(args: argparse.Namespace) -> None:
 
     _write_csv_header(args.output, fieldnames)
 
-    for idx, power_limit in enumerate(power_limits):
-        sm_clock = _resolve_value(sm_clocks, idx)
-        mem_clock = _resolve_value(mem_clocks, idx)
-
-        if power_limit is not None:
-            power_control.set_power_limit(power_limit, gpu_index=args.gpu)
-        if sm_clock is not None:
-            power_control.set_sm_clock(sm_clock, gpu_index=args.gpu)
-        if mem_clock is not None:
-            power_control.set_mem_clock(mem_clock, gpu_index=args.gpu)
-
-        if args.settle_seconds > 0:
-            time.sleep(args.settle_seconds)
-
-        sampler = PowerSampler(interval_s=args.sample_interval, gpu_index=args.gpu)
-        sampler.start()
-
-        try:
-            with torch.cuda.device(args.gpu):
-                results = benchmark(
-                    args.dtypes,
-                    args.m,
-                    args.n,
-                    args.k,
-                    args.warmup,
-                    args.iters,
-                )
-        finally:
-            sampler.stop()
-
-        stats = sampler.stats()
-        telemetry = power_control.query_telemetry(gpu_index=args.gpu)
-
-        # Build CSV row.
-        payload: Dict[str, object] = {
-            "timestamp": time.time(),
-            "tag": args.tag,
-            "gpu_index": args.gpu,
-            "power_limit_w": float(power_limit) if power_limit is not None else None,
-            "sm_clock_target_mhz": int(sm_clock) if sm_clock is not None else None,
-            "mem_clock_target_mhz": int(mem_clock) if mem_clock is not None else None,
-            "measured_sm_clock_mhz": telemetry.sm_clock_mhz,
-            "measured_mem_clock_mhz": telemetry.mem_clock_mhz,
-            "measured_temperature_c": telemetry.temperature_c,
-            **stats,
-        }
-
-        # Insert benchmark results per dtype.
-        for dtype in ("bf16", "fp8", "fp4"):
-            result = results.get(dtype)
-            payload[f"{dtype}_tflops"] = result.tflops if result else None
-            payload[f"{dtype}_avg_ms"] = result.avg_ms if result else None
-            payload[f"{dtype}_error"] = result.error if result and result.error else None
-
-        payload["raw_json"] = json.dumps(
-            {
-                "config": {
-                    "power_limit": power_limit,
-                    "sm_clock": sm_clock,
-                    "mem_clock": mem_clock,
-                },
-                "results": {
-                    dtype: res.to_dict() for dtype, res in results.items()
-                },
-                "telemetry": {
-                    "avg_power": stats["avg_power_w"],
-                    "samples": stats["power_samples"],
-                    "snapshot": telemetry.__dict__,
-                },
-            }
+    if args.optimize_clocks:
+        # Use the separate clock optimization module
+        optimization_results = optimize_all_power_limits(
+            power_limits,
+            args.sm_clock_range,
+            args.mem_clock_range,
+            args
         )
 
-        _append_csv(args.output, fieldnames, payload)
-        print(json.dumps(payload, indent=2))
+        # Save optimization results
+        save_optimization_results(optimization_results, args.output, args.tag)
+    else:
+        # Original sweep logic
+        sm_clocks = _parse_list(args.sm_clocks)
+        mem_clocks = _parse_list(args.mem_clocks)
+
+        for idx, power_limit in enumerate(power_limits):
+            sm_clock = _resolve_value(sm_clocks, idx)
+            mem_clock = _resolve_value(mem_clocks, idx)
+
+            if power_limit is not None:
+                power_control.set_power_limit(power_limit, gpu_index=args.gpu)
+            if sm_clock is not None:
+                power_control.set_sm_clock(sm_clock, gpu_index=args.gpu)
+            if mem_clock is not None:
+                power_control.set_mem_clock(mem_clock, gpu_index=args.gpu)
+
+            if args.settle_seconds > 0:
+                time.sleep(args.settle_seconds)
+
+            sampler = PowerSampler(interval_s=args.sample_interval, gpu_index=args.gpu)
+            sampler.start()
+
+            try:
+                with torch.cuda.device(args.gpu):
+                    results = benchmark(
+                        args.dtypes,
+                        args.m,
+                        args.n,
+                        args.k,
+                        args.warmup,
+                        args.iters,
+                    )
+            finally:
+                sampler.stop()
+
+            stats = sampler.stats()
+            telemetry = power_control.query_telemetry(gpu_index=args.gpu)
+
+            # Build CSV row.
+            payload: Dict[str, object] = {
+                "timestamp": time.time(),
+                "tag": args.tag,
+                "gpu_index": args.gpu,
+                "power_limit_w": float(power_limit) if power_limit is not None else None,
+                "sm_clock_target_mhz": int(sm_clock) if sm_clock is not None else None,
+                "mem_clock_target_mhz": int(mem_clock) if mem_clock is not None else None,
+                "measured_sm_clock_mhz": telemetry.sm_clock_mhz,
+                "measured_mem_clock_mhz": telemetry.mem_clock_mhz,
+                "measured_temperature_c": telemetry.temperature_c,
+                **stats,
+            }
+
+            # Insert benchmark results per dtype.
+            for dtype in ("bf16", "fp8", "fp4"):
+                result = results.get(dtype)
+                payload[f"{dtype}_tflops"] = result.tflops if result else None
+                payload[f"{dtype}_avg_ms"] = result.avg_ms if result else None
+                payload[f"{dtype}_error"] = result.error if result and result.error else None
+
+            payload["raw_json"] = json.dumps(
+                {
+                    "config": {
+                        "power_limit": power_limit,
+                        "sm_clock": sm_clock,
+                        "mem_clock": mem_clock,
+                    },
+                    "results": {
+                        dtype: res.to_dict() for dtype, res in results.items()
+                    },
+                    "telemetry": {
+                        "avg_power": stats["avg_power_w"],
+                        "samples": stats["power_samples"],
+                        "snapshot": telemetry.__dict__,
+                    },
+                }
+            )
+
+            _append_csv(args.output, fieldnames, payload)
+            print(json.dumps(payload, indent=2))
 
 
 def main() -> int:

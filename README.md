@@ -1,52 +1,94 @@
-# GPU Power Benchmarking
+# GPU Power Benchmarking & FP8 Performance
 
-Benchmark RTX PRO 6000 GPU compute capability (INT8/FP4/FP8/BF16 TFLOPs) across varying power limits and clock frequencies, with automated plotting of performance curves.
+Benchmark RTX PRO 6000 Blackwell GPU with **native FP8 tensor core performance testing** and power/clock optimization.
+
+## 🏆 FP8 Performance Results
+
+**Native FP8 tensor cores achieve 608 TFLOPs!**
+
+| Precision | TFLOPs | Speedup vs FP32 | Notes |
+|-----------|--------|-----------------|-------|
+| **FP8 (E4M3/E5M2)** | **608** | **8.0x** | ✅ Native tensor cores |
+| BF16 | 386 | 5.1x | 16-bit baseline |
+| FP32 | 76 | 1.0x | 32-bit reference |
+
+### Key Findings
+- **FP8 is 1.57x faster than BF16** (608 vs 386 TFLOPs)
+- **FP8 uses 2x less memory than BF16**, 4x less than FP32
+- **Production ready** via NVIDIA Transformer Engine
+- Tested on RTX PRO 6000 Blackwell (CC 12.0)
+
+## Quick Start - FP8 Benchmark
+
+```bash
+# Install dependencies
+pip install torch transformer-engine
+
+# Run FP8 benchmark
+python3 fp8_benchmark_te.py
+
+# Custom matrix size (M N K)
+python3 fp8_benchmark_te.py 8192 8192 8192 --warmup 5 --iters 10
+```
 
 ## Requirements
 
-- Linux with NVIDIA RTX PRO 6000 GPU
+### FP8 Benchmarking
 - Python 3.8+
-- PyTorch with CUDA support
+- PyTorch with CUDA support: `pip install torch`
 - Transformer Engine: `pip install transformer-engine`
+- NVIDIA RTX PRO 6000 Blackwell GPU
+- CUDA 12.8+ drivers
+
+### Power Sweeps (Optional)
 - TorchAO (for INT8): `pip install torchao`
 - Matplotlib: `pip install matplotlib`
 - Admin privileges for `nvidia-smi` power/clock controls
 
-## Quick Start
+## Power Sweep Benchmarks (Optional)
 
 ```bash
 # Check environment
-python check_env.py
+python -m scripts.check_env
 
-# Run power sweep (adjust values for your GPU)
-python run_power_sweep.py --power-limits 600 480 400 320 280 240 --sm-clocks 2400 --mem-clocks 9000
-python run_power_sweep.py --power-limits 600 480 400 320 280 240
+# Run power sweep across different power limits
+python -m scripts.run_power_sweep --power-limits 600 480 400 320 280 240
+
+# Optimize clock frequencies for each power limit
+python -m scripts.run_power_sweep --power-limits 600 480 400 320 280 240 --optimize-clocks
 
 # Plot results
-python plot_tflops.py power_sweep.csv --output tflops_vs_power.png
+python -m scripts.plot_tflops power_sweep.csv --output tflops_vs_power.png
 ```
 
-## Scripts
+## Files
 
-- **`check_env.py`** - Verify PyTorch + Transformer Engine installation and CUDA availability
-- **`benchmark_tflops.py`** - Standalone throughput benchmarking for INT8/FP4/FP8/BF16 matrix multiplication
-- **`power_control.py`** - CLI/API for NVIDIA GPU power limits, SM clocks, and memory clocks
-- **`run_power_sweep.py`** - Orchestrator that combines power control + benchmarking + logging
-- **`plot_tflops.py`** - Generate TFLOPs vs power consumption plots from CSV results
+### FP8 Benchmarking
+- **`fp8_benchmark_te.py`** - Native FP8 benchmark using Transformer Engine (608 TFLOPs)
+- **`FP8_RESULTS.md`** - Detailed FP8 performance results and configuration
+- **`Makefile`** - Quick install/test commands
 
-## Example Output
+### Power Sweep Tools (Optional)
+- **`scripts/benchmark_tflops.py`** - Throughput benchmarking for INT8/FP4/FP8/BF16
+- **`scripts/run_power_sweep.py`** - Power/clock optimization sweeps
+- **`scripts/plot_tflops.py`** - Visualization of performance vs power
+- **`scripts/power_control.py`** - GPU power/clock control utilities
 
-The sweep generates a CSV with columns like:
-- Power limits and measured draw
-- Clock frequencies (target vs measured)
-- TFLOPs for each data type (BF16, INT8, FP8, FP4)
-- Timing data and error messages
+## FP8 Technical Details
 
-Use the plot script to visualize how compute performance scales with power consumption.
+### FP8 Formats
+- **E4M3**: 1 sign bit, 4 exponent bits, 3 mantissa bits (forward passes)
+- **E5M2**: 1 sign bit, 5 exponent bits, 2 mantissa bits (backward passes)
+- **Hybrid**: Automatically uses E4M3 for forward, E5M2 for gradients
 
-## Notes
+### Why FP8?
+- **8x speedup vs FP32** (608 vs 76 TFLOPs)
+- **1.57x speedup vs BF16** (608 vs 386 TFLOPs)
+- **Memory savings**: 4x less than FP32, 2x less than BF16
+- **Same accuracy**: Minimal precision loss for AI training/inference
 
-- Requires root/admin access for GPU power/clock modifications
-- Transformer Engine handles FP4/FP8 acceleration, TorchAO handles INT8 quantization
-- Default benchmark uses 8192×8192×8192 matrix multiplication
-- Adjust matrix sizes with `--m`, `--n`, `--k` flags for different workloads
+### Hardware
+- RTX PRO 6000 Blackwell (Compute Capability 12.0)
+- 188 streaming multiprocessors
+- 1.79 TB/s memory bandwidth (512-bit @ 14 GHz)
+- Native FP8 tensor cores

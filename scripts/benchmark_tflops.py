@@ -38,9 +38,9 @@ class BenchmarkResult:
         return payload
 
 
-def _measure(fn: Callable[[], torch.Tensor], warmup: int, iters: int) -> float:
+def _measure(fn: Callable[[], torch.Tensor], warmup_iters: int, iters: int) -> float:
     torch.cuda.synchronize()
-    for _ in range(warmup):
+    for _ in range(warmup_iters):
         fn()
 
     torch.cuda.synchronize()
@@ -60,18 +60,18 @@ def _calc_tflops(m: int, n: int, k: int, ms: float) -> float:
     return (2.0 * m * n * k) / (ms * 1.0e9)  # convert ms to s -> TFLOPs
 
 
-def _bench_bf16(m: int, n: int, k: int, warmup: int, iters: int) -> BenchmarkResult:
+def _bench_bf16(m: int, n: int, k: int, warmup_iters: int, iters: int) -> BenchmarkResult:
     a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     b = torch.randn((k, n), device="cuda", dtype=torch.bfloat16)
 
     def run() -> torch.Tensor:
         return torch.matmul(a, b)
 
-    avg_ms = _measure(run, warmup, iters)
+    avg_ms = _measure(run, warmup_iters, iters)
     return BenchmarkResult("bf16", avg_ms, _calc_tflops(m, n, k, avg_ms))
 
 
-def _bench_int8(m: int, n: int, k: int, warmup: int, iters: int) -> BenchmarkResult:
+def _bench_int8(m: int, n: int, k: int, warmup_iters: int, iters: int) -> BenchmarkResult:
     # Create FP32 model and quantize to INT8 using torchao (weight-only quantization)
     linear_fp32 = torch.nn.Linear(k, n, bias=False, device="cuda", dtype=torch.float32)
     linear_fp32.weight.data = torch.randn((n, k), device="cuda", dtype=torch.float32)
@@ -89,7 +89,7 @@ def _bench_int8(m: int, n: int, k: int, warmup: int, iters: int) -> BenchmarkRes
         with torch.inference_mode():
             return linear_fp32(inp)
 
-    avg_ms = _measure(run, warmup, iters)
+    avg_ms = _measure(run, warmup_iters, iters)
     return BenchmarkResult("int8", avg_ms, _calc_tflops(m, n, k, avg_ms))
 
 
@@ -113,7 +113,7 @@ def _bench_te_linear(
     m: int,
     n: int,
     k: int,
-    warmup: int,
+    warmup_iters: int,
     iters: int,
 ) -> BenchmarkResult:
     recipe = _make_fp8_recipe(dtype)
@@ -133,7 +133,7 @@ def _bench_te_linear(
             with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
                 return linear(inp)
 
-    avg_ms = _measure(run, warmup, iters)
+    avg_ms = _measure(run, warmup_iters, iters)
     return BenchmarkResult(dtype, avg_ms, _calc_tflops(m, n, k, avg_ms))
 
 
@@ -142,7 +142,7 @@ def benchmark(
     m: int,
     n: int,
     k: int,
-    warmup: int,
+    warmup_iters: int,
     iters: int,
 ) -> Dict[str, BenchmarkResult]:
     results: Dict[str, BenchmarkResult] = {}
@@ -151,11 +151,11 @@ def benchmark(
         dtype_norm = dtype.lower()
         try:
             if dtype_norm == "bf16":
-                results[dtype_norm] = _bench_bf16(m, n, k, warmup, iters)
+                results[dtype_norm] = _bench_bf16(m, n, k, warmup_iters, iters)
             elif dtype_norm == "int8":
-                results[dtype_norm] = _bench_int8(m, n, k, warmup, iters)
+                results[dtype_norm] = _bench_int8(m, n, k, warmup_iters, iters)
             elif dtype_norm in {"fp8", "fp4"}:
-                results[dtype_norm] = _bench_te_linear(dtype_norm, m, n, k, warmup, iters)
+                results[dtype_norm] = _bench_te_linear(dtype_norm, m, n, k, warmup_iters, iters)
             else:
                 raise SystemExit(f"Unsupported dtype '{dtype}'. Choose from bf16, int8, fp8, fp4.")
         except Exception as exc:
@@ -175,7 +175,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--m", type=int, default=8192, help="M dimension (batch size)")
     parser.add_argument("--n", type=int, default=8192, help="N dimension (output features)")
     parser.add_argument("--k", type=int, default=8192, help="K dimension (input features)")
-    parser.add_argument("--warmup", type=int, default=20, help="Warm-up iterations")
+    parser.add_argument("--warmup_iters", type=int, default=20, help="Warm-up iterations")
     parser.add_argument("--iters", type=int, default=20, help="Timed iterations")
     parser.add_argument(
         "--output",
@@ -194,13 +194,13 @@ def main() -> None:
     dtypes = args.dtypes
 
     with torch.cuda.device(0):
-        results = benchmark(dtypes, args.m, args.n, args.k, args.warmup, args.iters)
+        results = benchmark(dtypes, args.m, args.n, args.k, args.warmup_iters, args.iters)
 
     payload = {
         "m": args.m,
         "n": args.n,
         "k": args.k,
-        "warmup": args.warmup,
+        "warmup_iters": args.warmup_iters,
         "iters": args.iters,
         "results": {name: result.to_dict() for name, result in results.items()},
     }

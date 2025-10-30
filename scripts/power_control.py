@@ -9,6 +9,7 @@ workflows as well as a CLI wrapper for manual experimentation.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
@@ -33,6 +34,11 @@ def _run_nvidia_smi(
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     cmd = ["nvidia-smi", "-i", str(gpu_index), *args]
+
+    # Automatically use sudo if not running as root
+    if os.geteuid() != 0:
+        cmd.insert(0, "sudo")
+
     result = subprocess.run(cmd, capture_output=True, text=True)
     if check and result.returncode != 0:
         raise RuntimeError(

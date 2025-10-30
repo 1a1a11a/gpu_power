@@ -35,8 +35,10 @@ def _load_curves(csv_path: Path, dtypes: Iterable[str]) -> Dict[str, List[Tuple[
         reader = csv.DictReader(handle)
 
         for row in reader:
-            power_limit = _parse_float(row.get("power_limit_w"))
-            if power_limit is None:
+            # Try different power column names (support both original and optimized formats)
+            power = (_parse_float(row.get("power_limit_w")) or
+                    _parse_float(row.get("avg_power_w")))
+            if power is None:
                 continue
 
             for dtype in dtypes:
@@ -44,7 +46,7 @@ def _load_curves(csv_path: Path, dtypes: Iterable[str]) -> Dict[str, List[Tuple[
                 tflops = _parse_float(row.get(tflops_key))
                 if tflops is None:
                     continue
-                curves[dtype].append((power_limit, tflops))
+                curves[dtype].append((power, tflops))
 
     # Sort each curve by power in descending order (high power first)
     for dtype in dtypes:
